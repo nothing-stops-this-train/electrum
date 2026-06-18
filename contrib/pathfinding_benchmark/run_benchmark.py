@@ -122,7 +122,22 @@ async def _amain(args) -> int:
                 if done % 50 == 0 or done == total:
                     print(f"\r  {done}/{total} attempts", end="", flush=True)
 
-            if lcfg is not None:
+            if args.compare_lnd:
+                from electrum.plugins.lnd_pathfinder.lnd_router import LndPathFinder
+                from electrum.plugins.lnd_pathfinder.mission_control import BimodalEstimator
+                # offline: no observation store, so the bimodal estimator uses the
+                # pure capacity-based prior (htlc_max / funding capacity per channel).
+                estimator = BimodalEstimator(cdb)
+                lnd_finder = LndPathFinder(
+                    cdb, blacklist_filter=path_finder._is_edge_blacklisted,
+                    probability_func=estimator)
+                print("compare mode: native LNPathFinder vs. standalone LndPathFinder "
+                      "(bimodal mission-control probability)")
+                compare_rows = pb.run_compare_lnd(
+                    channel_db=cdb, native_finder=path_finder, alt_finder=lnd_finder,
+                    config=config, cfg=cfg, progress=progress)
+                print()
+            elif lcfg is not None:
                 print(f"liquidity mode: capacity<-htlc_max (fallback {lcfg.default_capacity_sat} sat), "
                       f"payment_timeout_sec={lcfg.payment_timeout_sec}, "
                       f"hop_latency_sec={lcfg.hop_latency_sec}, balance_seed={lcfg.balance_seed}, "
@@ -143,6 +158,19 @@ async def _amain(args) -> int:
 
     out_dir = os.path.expanduser(args.out_dir)
     os.makedirs(out_dir, exist_ok=True)
+    if args.compare_lnd:
+        _write_csv(os.path.join(out_dir, "compare.csv"), pb.COMPARE_CSV_HEADER,
+                   [pb.compare_row_to_csv_row(r) for r in compare_rows])
+        table = pb.format_compare_summary(compare_rows)
+        alt_only = sum(1 for r in compare_rows if r.label == "alt_only")
+        native_only = sum(1 for r in compare_rows if r.label == "native_only")
+        print("\n" + table)
+        print(f"\nalt_only (native fails, LND succeeds): {alt_only}   "
+              f"native_only (LND fails, native succeeds): {native_only}")
+        with open(os.path.join(out_dir, "summary.txt"), "w") as f:
+            f.write(table + "\n")
+        print(f"\nwrote results to {out_dir}/ (compare.csv, summary.txt)")
+        return 0
     if lcfg is not None:
         _write_csv(os.path.join(out_dir, "attempts.csv"), pb.LIQUIDITY_RESULT_CSV_HEADER,
                    [pb.liquidity_result_to_csv_row(r) for r in results])
@@ -179,6 +207,10 @@ def main(argv=None) -> int:
     parser.add_argument("--liquidity", action="store_true",
                         help="model hidden channel balances and run the find_route->fail->retry "
                              "loop (exercises the dynamic liquidity path, not just static find_route)")
+    parser.add_argument("--compare-lnd", action="store_true",
+                        help="differential oracle: run the native finder and the standalone "
+                             "LndPathFinder over the same samples and write compare.csv "
+                             "(per-sample native vs LND outcome). Ignores --liquidity.")
     parser.add_argument("--payment-timeout-sec", type=float, default=120.0,
                         help="[liquidity] wall-clock budget per payment before giving up "
                              "(mirrors LNWallet.PAYMENT_TIMEOUT)")

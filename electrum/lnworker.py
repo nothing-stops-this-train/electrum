@@ -85,6 +85,7 @@ from .lnrouter import (
     LNPathInconsistent, fee_for_edge_msat,
 )
 from .lnwatcher import LNWatcher
+from .plugin import run_hook
 from .submarine_swaps import SwapManager
 from .mpp_split import suggest_splits, SplitConfigRating
 from .trampoline import (
@@ -2082,6 +2083,9 @@ class LNWallet(Logger):
                 self.network.path_finder.update_liquidity_hints(htlc_log.route, htlc_log.amount_msat)
                 # remove inflight htlcs from liquidity hints
                 self.network.path_finder.update_inflight_htlcs(htlc_log.route, add_htlcs=False)
+                # let plugins record the route result (e.g. an alternative pathfinder's
+                # mission-control store). failing_channel=None means the whole route succeeded.
+                run_hook('htlc_route_result', self, htlc_log.route, htlc_log.amount_msat, None)
             raise PaymentSuccess()
         # htlc failed
         # if we get a tmp channel failure, it might work to split the amount and try more routes
@@ -2209,6 +2213,8 @@ class LNWallet(Logger):
                         route,
                         amount,
                         failing_channel=ShortChannelID(failing_channel))
+                    run_hook('htlc_route_result', self, route, amount,
+                             ShortChannelID(failing_channel))
                 # if we can't decide on some action, we are stuck
                 if not (blacklist or update):
                     raise PaymentFailure(failure_msg.code_name())
@@ -2503,6 +2509,7 @@ class LNWallet(Logger):
                                     invoice_features=paysession.invoice_features,
                                     my_sending_channels=[channel] if is_multichan_mpp else my_active_channels,
                                     full_path=full_path,
+                                    payment_hash=paysession.payment_hash,
                                 ))
                             if not is_route_within_budget(
                                     route, budget=budget,
@@ -2567,6 +2574,7 @@ class LNWallet(Logger):
             invoice_features: int,
             my_sending_channels: List[Channel],
             full_path: Optional[LNPaymentPath],
+            payment_hash: bytes = None,  # only used for plugin route logging/joining
     ) -> LNPaymentRoute:
 
         my_sending_aliases = set(chan.get_local_scid_alias() for chan in my_sending_channels)
@@ -2616,13 +2624,21 @@ class LNWallet(Logger):
                 start_node = end_node
         # now find a route, end to end: between us and the recipient
         try:
-            route = self.network.path_finder.find_route(
-                nodeA=self.node_keypair.pubkey,
-                nodeB=invoice_pubkey,
-                invoice_amount_msat=amount_msat,
-                path=full_path,
-                my_sending_channels=my_sending_channels,
-                private_route_edges=private_route_edges)
+            # A plugin may supply/override the route (e.g. an alternative pathfinder
+            # that compares itself against the native one). It receives the same
+            # inputs and must return a byte-compatible LNPaymentRoute, or a falsy
+            # value to defer to the native path_finder below.
+            route = run_hook(
+                'get_route_for_payment', self, payment_hash, invoice_pubkey, amount_msat,
+                full_path, my_sending_channels, private_route_edges)
+            if not route:
+                route = self.network.path_finder.find_route(
+                    nodeA=self.node_keypair.pubkey,
+                    nodeB=invoice_pubkey,
+                    invoice_amount_msat=amount_msat,
+                    path=full_path,
+                    my_sending_channels=my_sending_channels,
+                    private_route_edges=private_route_edges)
         except NoChannelPolicy as e:
             raise NoPathFound() from e
         if not route:

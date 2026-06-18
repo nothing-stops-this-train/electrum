@@ -516,6 +516,122 @@ def format_summary_table(summaries: Sequence[BucketSummary]) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# differential oracle: native vs. an alternative (LND-style) finder
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CompareRow:
+    """One sample measured by both finders, with a divergence label."""
+    native: RouteResult
+    alt: RouteResult
+
+    @property
+    def label(self) -> str:
+        n, a = self.native.usable, self.alt.usable
+        if n and a:
+            return "both_ok"
+        if n and not a:
+            return "native_only"
+        if a and not n:
+            return "alt_only"  # the valuable case: native fails, alt succeeds
+        return "both_fail"
+
+
+def run_compare_lnd(
+        *,
+        channel_db: 'ChannelDB',
+        native_finder: 'LNPathFinder',
+        alt_finder,
+        config: 'SimpleConfig',
+        cfg: Optional[BenchmarkConfig] = None,
+        now: Optional[int] = None,
+        progress=None,
+) -> List[CompareRow]:
+    """Run both finders over the identical sampled (source, dest, amount) set.
+
+    ``alt_finder`` only needs a ``find_route(nodeA, nodeB, invoice_amount_msat)``
+    method (e.g. ``LndPathFinder``), which :func:`measure_route` calls
+    polymorphically. Sampling reuses the same seeded logic as
+    :func:`run_benchmark`, so every row compares the two finders on the same
+    input."""
+    if cfg is None:
+        cfg = BenchmarkConfig()
+    if now is None:
+        now = int(time.time())
+    rng = random.Random(cfg.seed)
+
+    tiers, _thresholds = classify_nodes(channel_db, cfg)
+    sources = select_sources(channel_db, cfg, tiers)
+    if not sources:
+        raise RuntimeError("no well-connected source nodes found in snapshot")
+    dests_by_tier = select_destinations(cfg, tiers, exclude=sources, rng=rng)
+    dest_items: List[Tuple[bytes, NodeTier]] = [
+        (d, tier) for tier, ds in dests_by_tier.items() for d in ds
+    ]
+    total = len(cfg.amounts_sat) * len(sources) * len(dest_items)
+    rows: List[CompareRow] = []
+    done = 0
+    for amount_sat in cfg.amounts_sat:
+        budget = _budget_for_amount(cfg, amount_sat, config)
+        for source in sources:
+            for dest, tier in dest_items:
+                if dest == source:
+                    done += 1
+                    continue
+                native = measure_route(
+                    path_finder=native_finder, channel_db=channel_db,
+                    source=source, dest=dest, dest_tier=tier,
+                    amount_sat=amount_sat, budget=budget, now=now)
+                alt = measure_route(
+                    path_finder=alt_finder, channel_db=channel_db,
+                    source=source, dest=dest, dest_tier=tier,
+                    amount_sat=amount_sat, budget=budget, now=now)
+                rows.append(CompareRow(native=native, alt=alt))
+                done += 1
+                if progress is not None:
+                    progress(done, total)
+    return rows
+
+
+COMPARE_CSV_HEADER = [
+    "amount_sat", "source", "dest", "dest_tier", "label",
+    "native_found", "native_within_budget", "native_hops", "native_fee_msat",
+    "alt_found", "alt_within_budget", "alt_hops", "alt_fee_msat",
+]
+
+
+def compare_row_to_csv_row(row: CompareRow) -> List:
+    n, a = row.native, row.alt
+    return [
+        n.amount_sat, n.source.hex(), n.dest.hex(), n.dest_tier.value, row.label,
+        int(n.found), int(n.within_budget), n.num_hops, n.fee_msat,
+        int(a.found), int(a.within_budget), a.num_hops, a.fee_msat,
+    ]
+
+
+def format_compare_summary(rows: Sequence[CompareRow]) -> str:
+    """Per-amount divergence counts between native and the alternative finder."""
+    amounts = sorted({r.native.amount_sat for r in rows})
+    header = (f"{'amount_sat':>11} {'samples':>8} {'both_ok':>8} {'native_only':>12} "
+              f"{'alt_only':>9} {'both_fail':>10} {'mean_hops_native':>17} {'mean_hops_alt':>14}")
+    lines = [header, "-" * len(header)]
+    for amount_sat in amounts:
+        bucket = [r for r in rows if r.native.amount_sat == amount_sat]
+        n = len(bucket)
+        counts = {"both_ok": 0, "native_only": 0, "alt_only": 0, "both_fail": 0}
+        for r in bucket:
+            counts[r.label] += 1
+        nh = [r.native.num_hops for r in bucket if r.native.usable and r.native.num_hops is not None]
+        ah = [r.alt.num_hops for r in bucket if r.alt.usable and r.alt.num_hops is not None]
+        mh_n = f"{statistics.mean(nh):.2f}" if nh else "-"
+        mh_a = f"{statistics.mean(ah):.2f}" if ah else "-"
+        lines.append(
+            f"{amount_sat:>11} {n:>8} {counts['both_ok']:>8} {counts['native_only']:>12} "
+            f"{counts['alt_only']:>9} {counts['both_fail']:>10} {mh_n:>17} {mh_a:>14}")
+    return "\n".join(lines)
+
+
 # ===========================================================================
 # liquidity-aware benchmark
 # ---------------------------------------------------------------------------
