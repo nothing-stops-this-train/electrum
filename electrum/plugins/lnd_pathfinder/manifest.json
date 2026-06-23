@@ -1,0 +1,7 @@
+{
+  "name": "lnd_pathfinder",
+  "fullname": "LND Pathfinder (shadow)",
+  "author": "The Electrum Developers",
+  "description": "On every Lightning payment, runs an LND-style pathfinder alongside Electrum's native one, auto-selects the cheaper route, and logs both routes to lnd_pathfinder.jsonl in the wallet directory for analysis. The LND finder only returns a path; Electrum still does the spending. No private keys are ever logged.",
+  "available_for": ["qt", "qml", "cmdline"]
+}

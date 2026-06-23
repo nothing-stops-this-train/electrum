@@ -1,0 +1,5 @@
+# captured gossip snapshots and benchmark outputs are not committed
+snapshots/
+results/
+*.gossip_db
+__pycache__/
