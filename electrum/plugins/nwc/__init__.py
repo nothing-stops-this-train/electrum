@@ -49,6 +49,7 @@ async def add_connection(
     name: str,
     daily_limit_sat=None,
     valid_for_sec=None,
+    receive_only=False,
     plugin: 'NWCServerPlugin' = None
 ) -> str:
     """
@@ -57,8 +58,10 @@ async def add_connection(
     arg:str:name:name for the connection (e.g. nostr client name)
     arg:int:daily_limit_sat:optional daily spending limit in satoshis
     arg:int:valid_for_sec:optional lifetime of the connection string in seconds
+    arg:bool:receive_only:if set, the connection can only create invoices and look them up
     """
-    connection_string: str = plugin.create_connection(name, daily_limit_sat, valid_for_sec)
+    connection_string: str = plugin.create_connection(
+        name, daily_limit_sat, valid_for_sec, receive_only=receive_only)
     return connection_string
 
 

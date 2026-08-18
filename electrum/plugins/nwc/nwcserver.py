@@ -103,13 +103,21 @@ class NWCServerPlugin(BasePlugin):
         if len(self.connections) != len(connections) and self.nwc_server:
             self.nwc_server.restart_event_handler()
 
-    def create_connection(self, name: str, daily_limit_sat: Optional[int], valid_for_sec: Optional[int]) -> str:
+    def create_connection(
+        self,
+        name: str,
+        daily_limit_sat: Optional[int],
+        valid_for_sec: Optional[int],
+        receive_only: bool = False,
+    ) -> str:
         assert self.connections is not None, f"Wallet not loaded yet"
         assert len(name) > 0, f"Invalid or missing connection name: {name}"
 
         for conn in self.connections.values():
             if conn['name'] == name:
                 raise ValueError(f"Connection name already exists: {name}")
+        if receive_only and daily_limit_sat is not None:
+            raise ValueError("A receive-only connection cannot have a spending budget")
 
         our_connection_secret = PrivateKey()
         our_connection_pubkey: str = our_connection_secret.public_key.hex()
@@ -126,9 +134,11 @@ class NWCServerPlugin(BasePlugin):
             connection['daily_limit_sat'] = daily_limit_sat
         if valid_for_sec:
             connection['valid_until'] = int(time.time()) + valid_for_sec
+        if receive_only:
+            connection['receive_only'] = True
         connection_string = self.serialize_connection_uri(client_secret.hex(), our_connection_pubkey)
         self.connections[client_pubkey] = connection
-        self.logger.debug(f"Added nwc connection: {name=}, {valid_for_sec=}, {daily_limit_sat=}")
+        self.logger.debug(f"Added nwc connection: {name=}, {valid_for_sec=}, {daily_limit_sat=}, {receive_only=}")
 
         if self.nwc_server:
             self.nwc_server.restart_event_handler()
@@ -152,6 +162,7 @@ class NWCServerPlugin(BasePlugin):
                 'valid_until': conn.get('valid_until', "unset"),
                 'daily_limit_sat': conn.get('daily_limit_sat', "unset"),
                 'client_pub': client_pub,
+                'receive_only': conn.get('receive_only', False),
             }
             connections_without_secrets[conn['name']] = data
         return connections_without_secrets
@@ -173,6 +184,12 @@ class NWCServerPlugin(BasePlugin):
 
         return uri
 
+    @classmethod
+    def get_client_pubkey_from_connection_string(cls, connection_string: str) -> str:
+        query = urllib.parse.urlparse(connection_string).query
+        client_secret_hex: str = urllib.parse.parse_qs(query)['secret'][0]
+        return PrivateKey(raw_secret=bytes.fromhex(client_secret_hex)).public_key.hex()
+
 
 class NWCServer(Logger, EventListener):
     INFO_EVENT_KIND: int        = 13194
@@ -182,6 +199,9 @@ class NWCServer(Logger, EventListener):
     SUPPORTED_SPENDING_METHODS: set[str] = {'pay_invoice'}
     SUPPORTED_METHODS: set[str] = {'make_invoice', 'lookup_invoice', 'get_balance', 'get_info',
                                    'list_transactions', 'notifications'}.union(SUPPORTED_SPENDING_METHODS)
+    # methods available to restricted (receive-only flagged) connections, e.g. for a point-of-sale
+    # that should only be able to create invoices and check whether they have been paid
+    RECEIVE_ONLY_METHODS: set[str] = {'make_invoice', 'lookup_invoice', 'get_info', 'notifications'}
     SUPPORTED_NOTIFICATIONS: list[str] = ["payment_sent", "payment_received"]
     SUPPORTED_ENCRYPTION_SCHEMES: set[str] = {'nip04'}
     INFO_EVENT_REBROADCAST_INTERVAL_SEC = 60 * 60 * 24
@@ -359,8 +379,13 @@ class NWCServer(Logger, EventListener):
         # run the according method
         method: str = content.get('method')
         self.logger.debug(f"got request: {method=}, {params=}")
+        if method in self.SUPPORTED_METHODS and method not in self.get_supported_methods(event.pubkey):
+            self.logger.debug(f"Restricted nwc method requested: {method}")
+            await self.send_error(event, "RESTRICTED", f"{method} not allowed for this connection",
+                                  error_restype=method)
+            return
         task: Optional[Awaitable] = None
-        if method == "pay_invoice" and not self.is_receive_only(event.pubkey):
+        if method == "pay_invoice":
             task = self.handle_pay_invoice(event, params)
         elif method == "make_invoice":
             task = self.handle_make_invoice(event, params)
@@ -519,6 +544,10 @@ class NWCServer(Logger, EventListener):
         status = None
         if invoice and invoice.is_lightning():
             status = self.wallet.get_invoice_status(invoice)
+        if invoice and self.is_restricted(request_event.pubkey) and not self.wallet.get_request(invoice.rhash):
+            # restricted connections can only look up incoming invoices,
+            # don't leak data about outgoing payments (preimages, fees, ...)
+            invoice = None
         if not invoice or status is None or status == PR_UNKNOWN:
             response = self.get_error_response("NOT_FOUND", "Invoice not found")
             return await self.send_encrypted_response(request_event.pubkey, json.dumps(response), request_event.id)
@@ -588,9 +617,7 @@ class NWCServer(Logger, EventListener):
         """
         height = self.wallet.lnworker.network.blockchain().height()
         blockhash = self.wallet.lnworker.network.blockchain().get_hash(height)
-        supported_methods = self.SUPPORTED_METHODS.copy()
-        if self.is_receive_only(request_event.pubkey):
-            supported_methods -= self.SUPPORTED_SPENDING_METHODS
+        supported_methods = self.get_supported_methods(request_event.pubkey)
         response = {
             "result_type": "get_info",
             "result": {
@@ -603,8 +630,8 @@ class NWCServer(Logger, EventListener):
                 "methods": list(supported_methods),
             }
         }
-        if self.SUPPORTED_NOTIFICATIONS:
-            response['result']['notifications'] = self.SUPPORTED_NOTIFICATIONS
+        if supported_notifications := self.get_supported_notifications(request_event.pubkey):
+            response['result']['notifications'] = supported_notifications
         await self.send_encrypted_response(request_event.pubkey, json.dumps(response), request_event.id)
 
     @log_exceptions
@@ -939,19 +966,11 @@ class NWCServer(Logger, EventListener):
         We re-publish info events regularly as some relays drop them after a couple days.
         https://github.com/nostr-protocol/nips/blob/75f246ed987c23c99d77bfa6aeeb1afb669e23f7/47.md#example-nip-47-info-event
         """
-        tags = []
-        if self.SUPPORTED_NOTIFICATIONS:
-            tags.append(['notifications', ' '.join(self.SUPPORTED_NOTIFICATIONS)])
-        if self.SUPPORTED_ENCRYPTION_SCHEMES:
-            tags.append(['encryption', ' '.join(self.SUPPORTED_ENCRYPTION_SCHEMES)])
         while True:
             for client_pubkey, connection in list(self.connections.items()):
                 if client_pubkey not in self.connections:
                     continue  # might was removed during sleep
-                supported_methods = self.SUPPORTED_METHODS.copy()
-                if self.is_receive_only(client_pubkey):
-                    supported_methods -= self.SUPPORTED_SPENDING_METHODS
-                content = ' '.join(supported_methods)
+                tags, content = self.get_info_event_content(client_pubkey)
                 event_id = await aionostr._add_event(
                     self.manager,
                     kind=self.INFO_EVENT_KIND,
@@ -963,6 +982,16 @@ class NWCServer(Logger, EventListener):
                 await asyncio.sleep(3)  # try not to blast every event at once so they don't get rate limited
             await asyncio.sleep(self.INFO_EVENT_REBROADCAST_INTERVAL_SEC)
 
+    def get_info_event_content(self, client_pubkey: str) -> Tuple[List[List[str]], str]:
+        """Returns the tags and content of the NIP-47 info event for the given connection."""
+        tags = []
+        if supported_notifications := self.get_supported_notifications(client_pubkey):
+            tags.append(['notifications', ' '.join(supported_notifications)])
+        if self.SUPPORTED_ENCRYPTION_SCHEMES:
+            tags.append(['encryption', ' '.join(self.SUPPORTED_ENCRYPTION_SCHEMES)])
+        content = ' '.join(self.get_supported_methods(client_pubkey))
+        return tags, content
+
     def publish_notification_event(self, content: dict):
         """
         https://github.com/nostr-protocol/nips/blob/75f246ed987c23c99d77bfa6aeeb1afb669e23f7/47.md#notification-events
@@ -971,6 +1000,8 @@ class NWCServer(Logger, EventListener):
             return
         self.logger.debug(f"Publishing notification event: {content}")
         for client_pubkey, connection in list(self.connections.items()):
+            if content.get('notification_type') not in self.get_supported_notifications(client_pubkey):
+                continue  # e.g. don't leak outgoing payment data to restricted connections
             coro = self.taskgroup.spawn(aionostr._add_event(
                 self.manager,
                 kind=self.NOTIFICATION_EVENT_KIND,
@@ -1007,7 +1038,26 @@ class NWCServer(Logger, EventListener):
         return None
 
     def is_receive_only(self, pubkey: str) -> bool:
-        return self.connections[pubkey].get('daily_limit_sat') == 0
+        return self.is_restricted(pubkey) or self.connections[pubkey].get('daily_limit_sat') == 0
+
+    def is_restricted(self, pubkey: str) -> bool:
+        """Restricted connections are limited to RECEIVE_ONLY_METHODS and cannot
+        access outgoing payment data."""
+        return bool(self.connections[pubkey].get('receive_only'))
+
+    def get_supported_methods(self, pubkey: str) -> set[str]:
+        """Returns the NIP-47 methods the given client connection is allowed to use."""
+        if self.is_restricted(pubkey):
+            return self.RECEIVE_ONLY_METHODS
+        if self.is_receive_only(pubkey):
+            return self.SUPPORTED_METHODS - self.SUPPORTED_SPENDING_METHODS
+        return self.SUPPORTED_METHODS
+
+    def get_supported_notifications(self, pubkey: str) -> list[str]:
+        """Returns the NIP-47 notification types the given client connection may receive."""
+        if self.is_restricted(pubkey):
+            return [n for n in self.SUPPORTED_NOTIFICATIONS if n == "payment_received"]
+        return self.SUPPORTED_NOTIFICATIONS
 
     @staticmethod
     def invoice_status_to_nip47_state(status) -> Optional[str]:

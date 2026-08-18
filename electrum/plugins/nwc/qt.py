@@ -29,7 +29,7 @@ from decimal import Decimal
 
 from PyQt6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QTreeWidget, QTreeWidgetItem,
-    QTextEdit, QApplication, QSpinBox, QSizePolicy, QComboBox, QLineEdit,
+    QTextEdit, QApplication, QSpinBox, QSizePolicy, QComboBox, QLineEdit, QCheckBox,
 )
 from PyQt6.QtGui import QPixmap, QImage
 from PyQt6.QtCore import Qt, QTimer
@@ -113,7 +113,9 @@ class Plugin(NWCServerPlugin):
                     expiry = _("never")
                 else:
                     expiry = datetime.fromtimestamp(conn['valid_until']).isoformat(' ')[:-3]
-                if conn['daily_limit_sat'] == 'unset':
+                if conn.get('receive_only'):
+                    limit = _('receive-only')
+                elif conn['daily_limit_sat'] == 'unset':
                     limit = _('unlimited')
                 else:
                     budget = self.config.format_amount(conn['daily_limit_sat'])
@@ -178,7 +180,9 @@ class Plugin(NWCServerPlugin):
                  "remote control your wallet using Nostr NIP-47.")
         warning = _("Most NWC clients only use a single of your relays, so ensure the relays accept your events.")
         supported_methods = _("Supported NIP-47 methods: {}").format(", ".join(self.nwc_server.SUPPORTED_METHODS))
-        info_msg = f"{info}\n\n{warning}\n\n{supported_methods}"
+        receive_only_info = _("Non-spending connections are limited to: {}").format(
+            ", ".join(self.nwc_server.RECEIVE_ONLY_METHODS))
+        info_msg = f"{info}\n\n{warning}\n\n{supported_methods}\n{receive_only_info}"
         info_button.clicked.connect(lambda: window.show_message(info_msg))
 
         title_hbox = QHBoxLayout()
@@ -221,6 +225,20 @@ class Plugin(NWCServerPlugin):
         limit_edit.setRange(-1, 100_000_000)
         limit_edit.setMaximumHeight(30)
         layout.addWidget(limit_edit)
+
+        # Receive-only checkbox
+        receive_only_cb = QCheckBox(_("Non-spending connection"))
+        receive_only_cb.setToolTip(
+            _("The connection can only create invoices and check whether they have been paid.\n"
+              "Useful e.g. for a point-of-sale that should not be able to spend from your wallet\n"
+              "or see your balance and payment history."))
+
+        def on_receive_only_toggled(checked: bool):
+            if checked:
+                limit_edit.setValue(None)
+            limit_edit.setEnabled(not checked)
+        receive_only_cb.toggled.connect(on_receive_only_toggled)
+        layout.addWidget(receive_only_cb)
 
         # Validity period field (optional)
         layout.addWidget(QLabel(_("Valid for seconds (optional):")))
@@ -265,7 +283,8 @@ class Plugin(NWCServerPlugin):
             connection_string = self.create_connection(
                 name=name,
                 daily_limit_sat=limit_edit.value(),
-                valid_for_sec=duration_limit
+                valid_for_sec=duration_limit,
+                receive_only=receive_only_cb.isChecked(),
             )
         except ValueError as e:
             window.show_error(str(e))
