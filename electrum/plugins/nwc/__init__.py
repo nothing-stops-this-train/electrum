@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 
 from electrum.commands import plugin_command
 from electrum.simple_config import SimpleConfig, ConfigVar
+from electrum.util import UserFacingException
 
 if TYPE_CHECKING:
     from .nwcserver import NWCServerPlugin
@@ -50,6 +51,7 @@ async def add_connection(
     daily_limit_sat=None,
     valid_for_sec=None,
     receive_only=False,
+    skip_relay_check=False,
     plugin: 'NWCServerPlugin' = None
 ) -> str:
     """
@@ -59,9 +61,20 @@ async def add_connection(
     arg:int:daily_limit_sat:optional daily spending limit in satoshis
     arg:int:valid_for_sec:optional lifetime of the connection string in seconds
     arg:bool:receive_only:if set, the connection can only create invoices and look them up
+    arg:bool:skip_relay_check:if set, don't verify that the main relay carries the connection's info event
     """
     connection_string: str = plugin.create_connection(
         name, daily_limit_sat, valid_for_sec, receive_only=receive_only)
+    if not skip_relay_check:
+        assert plugin.nwc_server is not None, "plugin not initialized, open a lightning enabled wallet first"
+        relay: str = plugin.config.NWC_RELAY
+        client_pubkey: str = plugin.get_client_pubkey_from_connection_string(connection_string)
+        if not await plugin.nwc_server.check_relay_carries_info_event(client_pubkey, relay):
+            plugin.remove_connection(name)
+            raise UserFacingException(
+                f"Could not verify that the relay {relay} carries the connection's info event. "
+                f"The connection was not created. Select a different relay (config plugins.nwc.relay) "
+                f"or use --skip_relay_check.")
     return connection_string
 
 

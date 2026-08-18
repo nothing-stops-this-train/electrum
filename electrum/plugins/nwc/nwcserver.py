@@ -28,7 +28,7 @@ import time
 import ssl
 import logging
 import urllib.parse
-from typing import TYPE_CHECKING, Optional, List, Tuple, Awaitable
+from typing import TYPE_CHECKING, Optional, List, Tuple, Awaitable, Iterable
 
 import electrum_aionostr as aionostr
 from electrum_aionostr.event import Event as nEvent
@@ -223,7 +223,7 @@ class NWCServer(Logger, EventListener):
         self.manager = None  # type: Optional[aionostr.Manager]
         self.register_callbacks()
 
-    def get_relay_manager(self) -> aionostr.Manager:
+    def get_relay_manager(self, relays: Optional[Iterable[str]] = None) -> aionostr.Manager:
         assert get_asyncio_loop() == get_running_loop(), "NWCServer must run in the aio event loop"
         nostr_logger = self.logger.getChild('aionostr')
         nostr_logger.setLevel(logging.INFO)
@@ -232,9 +232,11 @@ class NWCServer(Logger, EventListener):
             proxy = make_aiohttp_proxy_connector(network.proxy, self.ssl_context)
         else:
             proxy: Optional['ProxyConnector'] = None
-        return aionostr.Manager(
+        if relays is None:
             # ensure that we also connect to NWC_RELAY, even if it's not in the NOSTR_RELAYS
-            relays=set(self.config.NOSTR_RELAYS.split(",")) | {self.config.NWC_RELAY},  # type: ignore
+            relays = set(self.config.NOSTR_RELAYS.split(",")) | {self.config.NWC_RELAY}  # type: ignore
+        return aionostr.Manager(
+            relays=relays,
             private_key=PrivateKey().hex(),  # use random private key
             log=nostr_logger,
             ssl_context=self.ssl_context,
@@ -991,6 +993,46 @@ class NWCServer(Logger, EventListener):
             tags.append(['encryption', ' '.join(self.SUPPORTED_ENCRYPTION_SCHEMES)])
         content = ' '.join(self.get_supported_methods(client_pubkey))
         return tags, content
+
+    async def check_relay_carries_info_event(self, client_pubkey: str, relay_url: str, timeout: int = 20) -> bool:
+        """
+        Publishes the info event of the given connection to the given relay and fetches it
+        back, verifying that the relay accepts and serves the event. Returns False on failure.
+        """
+        assert client_pubkey in self.connections, "unknown connection"
+
+        async def check() -> bool:
+            manager = self.get_relay_manager(relays=[relay_url])
+            try:
+                await manager.connect()
+                if len(manager.relays) <= 0:
+                    self.logger.info(f"relay check: could not connect to {relay_url}")
+                    return False
+                tags, content = self.get_info_event_content(client_pubkey)
+                event_id = await aionostr._add_event(
+                    manager,
+                    kind=self.INFO_EVENT_KIND,
+                    tags=tags or None,
+                    content=content,
+                    private_key=self.connections[client_pubkey]['our_secret']
+                )
+                query = {"ids": [event_id], "kinds": [self.INFO_EVENT_KIND], "limit": 1}
+                async for event in manager.get_events(query, single_event=True, only_stored=True):
+                    if event.id == event_id:
+                        return True
+                self.logger.info(f"relay check: {relay_url} did not return the published info event")
+                return False
+            finally:
+                await manager.close()
+
+        try:
+            return await asyncio.wait_for(check(), timeout)
+        except asyncio.TimeoutError:
+            self.logger.info(f"relay check: timeout for {relay_url}")
+            return False
+        except Exception as e:
+            self.logger.info(f"relay check: failed for {relay_url}: {e!r}")
+            return False
 
     def publish_notification_event(self, content: dict):
         """

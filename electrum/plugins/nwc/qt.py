@@ -36,9 +36,10 @@ from PyQt6.QtCore import Qt, QTimer
 
 from electrum.i18n import _
 from electrum.plugin import hook
+from electrum.util import UserCancelled
 from electrum.gui.qt.util import (
     WindowModalDialog, Buttons, OkButton, CancelButton, CloseButton,
-    read_QIcon_from_bytes, read_QPixmap_from_bytes,
+    read_QIcon_from_bytes, read_QPixmap_from_bytes, RunCoroutineDialog,
 )
 from electrum.gui.common_qt.util import paintQR
 
@@ -168,9 +169,14 @@ class Plugin(NWCServerPlugin):
         def create_connection():
             # Show a dialog to create a new connection
             connection_string = self.connection_info_input_dialog(window)
-            if connection_string:
+            if not connection_string:
+                return
+            update_connections_list()
+            if not self.verify_main_relay_dialog(window, connection_string):
+                # the connection has been removed again
                 update_connections_list()
-                self.show_new_connection_dialog(window, connection_string)
+                return
+            self.show_new_connection_dialog(window, connection_string)
         create_btn.clicked.connect(create_connection)
 
         # Add the info and close button to the footer
@@ -295,6 +301,33 @@ class Plugin(NWCServerPlugin):
             return None
 
         return connection_string
+
+    def verify_main_relay_dialog(self, window, connection_string: str) -> bool:
+        """Verifies that the main relay carries the connection's info event,
+        removing the connection again and showing an error if it doesn't."""
+        relay: str = self.config.NWC_RELAY  # type: ignore
+        client_pubkey = self.get_client_pubkey_from_connection_string(connection_string)
+        coro = self.nwc_server.check_relay_carries_info_event(client_pubkey, relay)
+        cancelled = False
+        try:
+            success = bool(RunCoroutineDialog(window, _("Verifying relay..."), coro).run())
+        except UserCancelled:
+            success = False
+            cancelled = True
+        except Exception:
+            self.logger.exception("nwc relay check failed")
+            success = False
+        if success:
+            return True
+        for name, conn in self.list_connections().items():
+            if conn['client_pub'] == client_pubkey:
+                self.remove_connection(name)
+                break
+        if not cancelled:
+            window.show_error(
+                _("Could not verify that the relay {} carries the connection's info event. "
+                  "The connection was not created. Select a different main relay and try again.").format(relay))
+        return False
 
     @staticmethod
     def show_new_connection_dialog(window, connection_string: str):
